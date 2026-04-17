@@ -55,29 +55,17 @@ $ curl -X POST "http://localhost:8000/ask?question=Hello"
 
 ## Part 2: Docker
 
-### Exercise 2.1: Dockerfile cơ bản
+### Exercise 2.1: Dockerfile 
 
-1. **Base image là gì?** — Base image là image gốc mà Dockerfile kế thừa, được khai báo bằng `FROM`. Nó cung cấp OS, runtime, và các tool cơ bản. Ví dụ `python:3.11` cung cấp sẵn Python 3.11 và pip, giúp không cần cài thủ công.
-
-2. **Working directory là gì?** — `WORKDIR` đặt thư mục làm việc mặc định bên trong container cho tất cả các lệnh `RUN`, `COPY`, `CMD` phía sau. Nếu thư mục chưa tồn tại, Docker tự tạo. Giúp tránh dùng đường dẫn tuyệt đối dài và giữ code gọn gàng.
-
-3. **Tại sao COPY requirements.txt trước khi COPY code?** — Docker build từng instruction thành một layer và cache lại. Dependencies thường ít thay đổi hơn code. Nếu `requirements.txt` không đổi, layer `pip install` được dùng từ cache → build nhanh hơn nhiều. Ngược lại, nếu COPY toàn bộ code trước, mỗi lần sửa bất kỳ file nào cũng invalidate cache và phải pip install lại từ đầu.
-
-4. **CMD vs ENTRYPOINT khác nhau thế nào?** — `ENTRYPOINT` định nghĩa executable chính của container, không bị override bởi argument truyền vào `docker run`. `CMD` cung cấp lệnh/argument mặc định, có thể bị override hoàn toàn khi truyền command vào `docker run <image> <cmd>`. Thường kết hợp: `ENTRYPOINT` = binary, `CMD` = default arguments.
+1. **Base image:** `python:3.11` — full Python distribution, khoảng ~1 GB
+2. **Working directory:** `/app`
+3. **Tại sao COPY requirements.txt trước?** — Docker build theo từng layer. Nếu `requirements.txt` không thay đổi, layer `pip install` được cache lại → build nhanh hơn. Nếu copy code trước, mỗi lần sửa code đều phải pip install lại.
+4. **CMD vs ENTRYPOINT khác nhau thế nào?** — `CMD` cung cấp lệnh mặc định, có thể bị override khi chạy `docker run <image> <other-cmd>`. `ENTRYPOINT` cố định binary chính, không bị override dễ dàng — thường dùng cho executable container.
 
 ### Exercise 2.2: Build và run
 
 ```bash
-$ docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
-$ docker run -p 8000:8000 my-agent:develop
-
-$ curl http://localhost:8000/ask -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is Docker?"}'
-{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
-
 $ docker images my-agent:develop
-WARNING: This output is designed for human readability. For machine-readable output, please use --format.
 my-agent:develop     5eadf0e1b361    1.66GB
 ```
 
@@ -104,20 +92,38 @@ my-agent:develop     5eadf0e1b361    1.66GB
 ### Exercise 2.4: Docker Compose architecture
 
 ```
-Client
-  │
-  ▼
-agent (FastAPI :8000)
-  │
-  ▼
-redis (Redis :6379)
+Client (HTTP :80 / HTTPS :443)
+        │
+        ▼
+┌──────────────────┐
+│  Nginx           │  Reverse proxy + Load balancer
+│  (nginx:alpine)  │
+└────────┬─────────┘
+         │ internal network
+         ▼
+┌──────────────────┐
+│  Agent           │  FastAPI AI agent (scalable)
+│  (python:3.11)   │──────────────────────────────┐
+│  :8000           │                              │
+└────────┬─────────┘                              │
+         │                                        │
+         ▼                                        ▼
+┌──────────────────┐                 ┌────────────────────┐
+│  Redis           │                 │  Qdrant            │
+│  (redis:7-alpine)│                 │  (qdrant:v1.9.0)   │
+│  :6379           │                 │  :6333             │
+│  Session cache   │                 │  Vector database   │
+│  Rate limiting   │                 │  (RAG)             │
+└──────────────────┘                 └────────────────────┘
 ```
 
-Services:
-- **agent**: FastAPI app, build từ Dockerfile, expose port 8000, đọc env từ `.env`, phụ thuộc redis healthy
-- **redis**: Redis 7 Alpine, giới hạn 128 MB RAM, dùng LRU eviction policy
+**4 services:**
+- **nginx**: Reverse proxy, expose port 80/443 ra ngoài, phân tán traffic đến agent. Client chỉ giao tiếp qua Nginx, không trực tiếp với agent.
+- **agent**: FastAPI app, build từ Dockerfile stage `runtime`, không expose port trực tiếp ra host — chỉ accessible qua Nginx trong internal network.
+- **redis**: Cache session và rate limiting, giới hạn 256 MB RAM, LRU eviction, có volume `redis_data` để persist data khi restart.
+- **qdrant**: Vector database cho RAG (Retrieval-Augmented Generation), có volume `qdrant_data`.
 
-Services communicate qua Docker internal network, agent kết nối redis qua `REDIS_URL=redis://redis:6379/0` (dùng service name `redis` làm hostname).
+**Tất cả services dùng chung network `internal` (bridge driver)** — isolated, không expose ra ngoài trừ Nginx. Agent kết nối Redis qua `redis://redis:6379/0` và Qdrant qua `http://qdrant:6333` bằng service name làm hostname.
 
 ---
 
@@ -125,27 +131,14 @@ Services communicate qua Docker internal network, agent kết nối redis qua `R
 
 ### Exercise 3.1 & 3.2: Deployment
 
-**Platform:** Render  
-**URL:** https://ai-agent-production.onrender.com  
+**Platform:** Railway
+**URL:** https://myagent-production-7f17.up.railway.app 
 
 **Test kết quả:**
 ```bash
 # Health check
-curl https://ai-agent-production.onrender.com/health
-# → {"status":"ok","version":"1.0.0","environment":"production",...}
-
-# Không có key → 401
-curl -X POST https://ai-agent-production.onrender.com/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Hello"}'
-# → {"detail":"Invalid or missing API key..."}
-
-# Có key → 200
-curl -X POST https://ai-agent-production.onrender.com/ask \
-  -H "X-API-Key: <AGENT_API_KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is deployment?"}'
-# → {"question":"...","answer":"...","model":"gpt-4o-mini","timestamp":"..."}
+curl https://myagent-production-7f17.up.railway.app/health
+# → {"status":"ok","uptime_seconds":8920.1,"platform":"Railway","timestamp":"2026-04-17T10:55:00.804693+00:00"}
 ```
 
 **So sánh `render.yaml` vs `railway.toml`:**
@@ -197,127 +190,205 @@ JWT flow trong `app/auth.py`:
 2. Token expire sau 3600 giây (1 giờ)
 3. `verify_jwt_token(token)` → decode và validate, raise 401 nếu expired hoặc invalid
 
-### Exercise 4.3: Rate Limiting
-
-**Algorithm:** Sliding window (cửa sổ trượt 60 giây)
-
-**Cơ chế:**
-- Mỗi API key có một `deque` lưu timestamp các request
-- Mỗi request: xóa các timestamp cũ hơn 60 giây, đếm số còn lại
-- Nếu ≥ `RATE_LIMIT_PER_MINUTE` (mặc định 20) → raise `HTTPException(429)` với header `Retry-After: 60`
-
-**Limit:** 20 req/min mặc định, cấu hình qua env var `RATE_LIMIT_PER_MINUTE`
-
-**Test:**
+**Get token:**
 ```bash
-for i in {1..25}; do
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    http://localhost:8000/ask -X POST \
-    -H "X-API-Key: dev-key-change-me-in-production" \
+curl http://localhost:8000/token -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"username": "student", "password": "demo123"}'
+# {"access_token": "eyJ...", "token_type": "bearer"}
+```
+
+**Use token:**
+```bash
+TOKEN="eyJ..."
+curl http://localhost:8000/ask -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Explain JWT"}'
+# {"answer": "..."}
+```
+
+### Exercise 4.3: Rate Limiting (`04-api-gateway/production/rate_limiter.py`)
+
+**Algorithm:** Sliding Window Counter — mỗi user có một `deque` lưu timestamp các request. Mỗi lần request, các timestamp cũ hơn `window_seconds` bị xóa, sau đó so sánh số còn lại với `max_requests`.
+
+**Giới hạn:**
+- User thường: **10 requests / 60 giây** (`rate_limiter_user`)
+- Admin: **100 requests / 60 giây** (`rate_limiter_admin`)
+
+**Admin bypass limit như thế nào:**
+JWT payload chứa field `role`. Endpoint đọc `user["role"]` và gọi `rate_limiter_admin.check(user_id)` hoặc `rate_limiter_user.check(user_id)` tương ứng — admin dùng bucket 100 req/min.
+
+**Test — hit limit:**
+```bash
+for i in {1..15}; do
+  curl http://localhost:8000/ask -X POST \
+    -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"question": "test"}'
+    -d '{"question": "Test '$i'"}'
+  echo ""
 done
-# Request 1-20: 200
-# Request 21+: 429
+# Request 1–10:  200 OK, header X-RateLimit-Remaining đếm ngược
+# Request 11+:   429 Too Many Requests
+# {"detail": {"error": "Rate limit exceeded", "limit": 10, "retry_after_seconds": N}}
 ```
 
-### Exercise 4.4: Cost Guard Implementation
+### Exercise 4.4: Cost Guard Implementation (`04-api-gateway/production/cost_guard.py`)
 
-Cost guard trong `app/cost_guard.py` dùng in-memory tracking theo ngày:
-- Reset mỗi ngày mới (so sánh `time.strftime("%Y-%m-%d")`)
-- Budget: `DAILY_BUDGET_USD` (mặc định $5.0/ngày)
-- Chi phí ước tính: input tokens × $0.00015/1K + output tokens × $0.0006/1K
-- Vượt budget → raise `HTTPException(503)`
+**Cách tiếp cận:**
+`CostGuard` theo dõi token usage theo từng user theo ngày bằng in-memory `dict[user_id → UsageRecord]`. Mỗi `UsageRecord` tích lũy `input_tokens` và `output_tokens`; chi phí tính theo:
 
+```
+cost = (input_tokens / 1000) × $0.00015 + (output_tokens / 1000) × $0.0006
+```
+
+Hai mức giới hạn:
+- **Per-user:** `daily_budget_usd = $1.00` — raise `HTTP 402` khi vượt
+- **Global:** `global_daily_budget_usd = $10.00` — raise `HTTP 503` khi toàn service vượt budget
+
+**Flow:**
+1. `check_budget(user_id)` được gọi trước khi gọi LLM — block nếu đã vượt budget
+2. LLM chạy và trả về số token
+3. `record_usage(user_id, input_tokens, output_tokens)` cập nhật record và global counter
+4. Khi đạt 80% budget per-user, ghi warning vào log
+
+**Phiên bản dùng Redis (production-grade):**
 ```python
-def check_and_record_cost(input_tokens: int, output_tokens: int) -> None:
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:       # reset mỗi ngày
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    month_key = datetime.now().strftime("%Y-%m")
+    key = f"budget:{user_id}:{month_key}"
+    current = float(r.get(key) or 0)
+    if current + estimated_cost > 10:
+        return False
+    r.incrbyfloat(key, estimated_cost)
+    r.expire(key, 32 * 24 * 3600)  # tự reset sau ~1 tháng
+    return True
 ```
+Dùng Redis thay vì in-memory đảm bảo budget counter tồn tại sau khi restart và được chia sẻ giữa tất cả instances khi scale.
 
 ---
 
 ## Part 5: Scaling & Reliability
 
-### Exercise 5.1: Health Checks
+### Exercise 5.1: Health checks (`05-scaling-reliability/develop/app.py`)
 
-Đã implement 2 endpoints:
+**Implementation:**
 
 ```python
-@app.get("/health")   # Liveness probe
+@app.get("/health")
 def health():
-    return {"status": "ok", "uptime_seconds": ..., "checks": {...}}
+    """Liveness probe — process còn sống không?"""
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "version": "1.0.0",
+        "environment": os.getenv("ENVIRONMENT", "development"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": { "memory": {"status": "ok", "used_percent": mem.percent} }
+    }
 
-@app.get("/ready")    # Readiness probe
+@app.get("/ready")
 def ready():
+    """Readiness probe — app đã sẵn sàng nhận traffic chưa?"""
     if not _is_ready:
-        raise HTTPException(503, "Not ready")
-    return {"ready": True}
+        raise HTTPException(503, "Agent not ready. Check back in a few seconds.")
+    return {"ready": True, "in_flight_requests": _in_flight_requests}
 ```
 
-- `/health`: platform dùng để kiểm tra process còn sống → restart nếu fail
-- `/ready`: load balancer dùng để kiểm tra sẵn sàng nhận traffic → không route request nếu fail (ví dụ khi đang khởi động)
+**Sự khác nhau giữa `/health` và `/ready`:**
 
-### Exercise 5.2: Graceful Shutdown
+| Probe | Mục đích | Trả về 503 khi |
+|---|---|---|
+| `/health` (liveness) | Process còn sống không? Platform restart container nếu fail | Process bị crash hoặc treo |
+| `/ready` (readiness) | App sẵn sàng nhận traffic chưa? Load balancer ngừng route nếu fail | Đang khởi động, shutdown, hoặc dependency chưa sẵn sàng |
 
-```python
-def _handle_signal(signum, _frame):
-    logger.info(json.dumps({"event": "signal", "signum": signum}))
+### Exercise 5.2: Graceful shutdown (`05-scaling-reliability/develop/app.py`)
 
-signal.signal(signal.SIGTERM, _handle_signal)
-```
+**Cách hoạt động:**
+App dùng FastAPI `lifespan` context manager. Khi shutdown (SIGTERM → uvicorn → lifespan exit), app đặt `_is_ready = False` để ngừng nhận request mới, sau đó poll `_in_flight_requests` cho đến khi về 0 hoặc hết timeout 30 giây.
 
-Uvicorn được start với `timeout_graceful_shutdown=30` — khi nhận SIGTERM, Uvicorn:
-1. Ngừng nhận request mới
-2. Chờ tối đa 30 giây cho các request đang xử lý hoàn thành
-3. Sau đó shutdown
+Signal handler `signal.signal(SIGTERM, handle_sigterm)` ghi log khi nhận tín hiệu; uvicorn's SIGTERM handler thực sự kích hoạt lifespan shutdown.
 
 **Test:**
 ```bash
-# Start app, gửi request dài, rồi kill -TERM
-docker stop <container>  # Docker gửi SIGTERM trước SIGKILL
-# → Request đang xử lý hoàn thành trước khi container dừng
+python app.py &
+PID=$!
+
+# Gửi request chậm
+curl http://localhost:8000/ask -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Long task"}' &
+
+# Ngay lập tức gửi SIGTERM
+kill -TERM $PID
+
+# Quan sát: request đang xử lý hoàn thành trước khi process thoát
+# Log hiển thị: "Waiting for 1 in-flight requests..." rồi "Shutdown complete"
 ```
 
-### Exercise 5.3: Stateless Design
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
 
-**Anti-pattern (trong memory):**
+**Anti-pattern (stateful — lưu trong memory):**
 ```python
-conversation_history = {}   # mỗi instance có dict riêng
-                             # scale ra 3 instances → 3 dict khác nhau
+# In-memory dict — mất khi process chết, không chia sẻ giữa các instances
+conversation_history = {}
+
+@app.post("/ask")
+def ask(user_id: str, question: str):
+    history = conversation_history.get(user_id, [])
 ```
 
-**Correct (trong Redis):**
+**Đúng (stateless — lưu trong Redis):**
 ```python
-history = r.lrange(f"history:{user_id}", 0, -1)
-# Tất cả instances đọc từ cùng 1 Redis
-# Instance nào xử lý request cũng có đúng history
+# Redis-backed — mọi instance đều đọc được session của bất kỳ user nào
+def load_session(session_id: str) -> dict:
+    data = _redis.get(f"session:{session_id}")
+    return json.loads(data) if data else {}
+
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    session_id = body.session_id or str(uuid.uuid4())
+    append_to_history(session_id, "user", body.question)   # ghi vào Redis
+    answer = ask(body.question)
+    append_to_history(session_id, "assistant", answer)     # ghi vào Redis
+    return {"session_id": session_id, "answer": answer, "served_by": INSTANCE_ID}
 ```
 
-App hiện tại đã stateless — rate limiter và cost guard dùng in-memory (chấp nhận được vì là per-instance limit), conversation history không lưu state.
+**Tại sao stateless quan trọng:**
+Khi 3 agent instances chạy sau Nginx, mỗi request có thể rơi vào bất kỳ instance nào. Nếu session data nằm trong memory của instance, request thứ 2 của user rơi vào instance khác sẽ không có history. Redis là shared external store — instance nào cũng đọc được cùng key `session:{id}` bất kể instance nào xử lý request đầu tiên.
 
-### Exercise 5.4: Load Balancing
+### Exercise 5.4: Load balancing
 
 ```bash
 docker compose up --scale agent=3
 ```
 
-Nginx phân tán request theo round-robin. Nếu 1 instance fail health check, Nginx tự loại khỏi pool.
+**Quan sát:**
+- Docker Compose tạo 3 container: `agent-1`, `agent-2`, `agent-3`
+- Nginx upstream `agent_backend` resolve `agent:8000` — Docker's internal DNS trả về cả 3 IP, Nginx round-robin qua chúng
+- Field `served_by` trong response `/chat` luân phiên giữa 3 `INSTANCE_ID`, xác nhận traffic được phân tán
+- Nếu kill 1 instance, Nginx ngừng route đến nó khi upstream probe tiếp theo fail; 2 instance còn lại tiếp tục phục vụ
 
-**Kết quả:** 10 request được xử lý bởi 3 instance khác nhau (kiểm tra qua `docker compose logs agent`).
+**Test:**
+```bash
+for i in {1..10}; do
+  curl -s http://localhost/chat -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"question": "Request '$i'"}' | python3 -m json.tool | grep served_by
+done
+# Output luân phiên giữa instance-abc123, instance-def456, instance-ghi789
+```
 
-### Exercise 5.5: Stateless Test
+### Exercise 5.5: Stateless test (`05-scaling-reliability/production/test_stateless.py`)
 
-Kịch bản:
-1. Gọi `/ask` → instance 1 xử lý
-2. Kill instance 1
-3. Gọi tiếp → instance 2 hoặc 3 xử lý → vẫn hoạt động bình thường
+```bash
+python test_stateless.py
+```
 
-→ Confirm: stateless design cho phép horizontal scaling mà không mất session.
+**Script kiểm tra những gì:**
+1. Tạo một conversation trên một instance — lưu `session_id`
+2. Gửi các tin nhắn tiếp theo — mỗi tin có thể được xử lý bởi instance khác nhau
+3. Kiểm tra conversation history còn nguyên vẹn bất kể instance nào xử lý từng lượt
+4. Nếu Redis available, kill một container ngẫu nhiên và xác nhận session tồn tại trên các instance còn lại
+
+**Kết quả mong đợi:** Tất cả lượt hội thoại đều có trong history cuối cùng, và `served_by` hiển thị các instance ID khác nhau — chứng minh state nằm trong Redis, không phải trong memory của bất kỳ process nào.
